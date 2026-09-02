@@ -84,7 +84,7 @@ fn run(cfg: &Config, pass: &str, root: &Path) -> Result<()> {
         .list(None, Some("*"))?
         .iter()
         .filter(|n| !n.attributes().contains(&NameAttribute::NoSelect))
-        .filter(|n| cfg.folders.as_ref().map_or(true, |f| f.iter().any(|x| x == n.name())))
+        .filter(|n| cfg.folders.as_ref().is_none_or(|f| f.iter().any(|x| x == n.name())))
         .map(|n| {
             let delim = n.delimiter().unwrap_or("/");
             (n.name().to_string(), n.name().split(delim).fold(root.to_path_buf(), |p, c| p.join(c)))
