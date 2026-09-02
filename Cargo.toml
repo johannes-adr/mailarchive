@@ -5,10 +5,10 @@ edition = "2021"
 description = "Tiny incremental, IDLE-driven IMAP -> Maildir sync (like mbsync)"
 
 [dependencies]
+clap = { version = "4.6.6", features = ["derive", "env"] }
+dotenvy = "0.15.7"
 imap = "3.0.0-alpha.15"
 imap-proto = "0.16"
-serde = { version = "1", features = ["derive"] }
-toml = "0.8"
 
 [profile.release]
 strip = true

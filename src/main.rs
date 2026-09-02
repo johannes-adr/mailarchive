@@ -3,13 +3,22 @@
 //! Every IMAP folder becomes a Maildir (`cur/`, `new/`, `tmp/`) below the configured root,
 //! nested according to the server's hierarchy delimiter. Messages are stored verbatim as
 //! RFC 5322 text. Per folder a `.uidvalidity` file remembers UIDVALIDITY and the highest
-//! UID seen, so every run only fetches what is new; flags and deletions are mirrored too.
+//! UID seen, so every run only fetches what is new.
+//!
+//! It is an archive, not a mirror: a message that disappears server-side stays on disk
+//! unless `--expunge` is set, a changed UIDVALIDITY makes the folder stop rather than
+//! delete anything, and every message is fsynced before its name becomes visible.
+//!
+//! Configuration comes from CLI flags, each with an env fallback; a `.env` in the working
+//! directory is loaded first. The password is the one setting with no flag - it would be
+//! world-readable in `ps` - so it lives in `MAILARCHIVE_PASS` or behind `--pass-cmd`.
 
+use clap::Parser;
 use imap_proto::NameAttribute;
 use imap::types::Flag;
 use imap::{extensions::idle::WaitOutcome, Connection, ConnectionMode, Session};
-use serde::Deserialize;
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::{env, fs, process::Command, thread};
@@ -17,39 +26,73 @@ use std::{env, fs, process::Command, thread};
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 type Sess = Session<Connection>;
 
-#[derive(Deserialize)]
+/// Incremental, IDLE-driven IMAP -> Maildir archive.
+#[derive(Parser)]
+#[command(version, about, after_help = "\
+The password has no flag on purpose (it would show up in `ps`): set MAILARCHIVE_PASS,
+or point --pass-cmd at a command that prints it. Every flag can also be given as its
+env var, and a `.env` in the working directory is read before the flags are parsed.")]
 struct Config {
+    /// IMAP server host
+    #[arg(long, env = "MAILARCHIVE_HOST")]
     host: String,
-    #[serde(default = "default_port")]
+
+    /// IMAP server port
+    #[arg(long, env = "MAILARCHIVE_PORT", default_value_t = 993)]
     port: u16,
+
+    /// Login user
+    #[arg(long, env = "MAILARCHIVE_USER")]
     user: String,
-    pass: Option<String>,
+
+    /// Command printing the password on stdout (alternative to MAILARCHIVE_PASS)
+    #[arg(long, env = "MAILARCHIVE_PASS_CMD")]
     pass_cmd: Option<String>,
+
+    /// Local Maildir root ("~" is expanded)
+    #[arg(long, env = "MAILARCHIVE_MAILDIR")]
     maildir: String,
-    /// false = plain TCP without TLS (local/test servers only)
-    #[serde(default = "default_tls")]
+
+    /// Use TLS; `--tls false` is plain TCP for local/test servers only
+    #[arg(long, env = "MAILARCHIVE_TLS", default_value_t = true,
+          num_args = 0..=1, default_missing_value = "true")]
     tls: bool,
-    folders: Option<Vec<String>>,
-    #[serde(default = "default_idle")]
+
+    /// Only sync these folders (comma separated; default: all)
+    #[arg(long, env = "MAILARCHIVE_FOLDERS", value_delimiter = ',')]
+    folders: Vec<String>,
+
+    /// Seconds to wait in IDLE on INBOX before a full re-sync of all folders
+    #[arg(long, env = "MAILARCHIVE_IDLE_SECS", default_value_t = 1500)]
     idle_secs: u64,
+
+    /// Mirror server-side deletions by deleting the local copy. Off by default: this is an
+    /// archive, so what vanishes upstream (expunge, retention policy, a stray phone tap)
+    /// is kept here.
+    #[arg(long, env = "MAILARCHIVE_EXPUNGE", default_value_t = false,
+          num_args = 0..=1, default_missing_value = "true")]
+    expunge: bool,
+
+    /// Mirror flag changes (\Seen, \Flagged, ...) by renaming the local file
+    #[arg(long, env = "MAILARCHIVE_SYNC_FLAGS", default_value_t = true,
+          num_args = 0..=1, default_missing_value = "true")]
+    sync_flags: bool,
 }
-fn default_port() -> u16 { 993 }
-fn default_idle() -> u64 { 1500 }
-fn default_tls() -> bool { true }
 
 fn main() {
-    let path = env::args().nth(1).unwrap_or_else(|| "config.toml".into());
-    let cfg: Config = fs::read_to_string(&path)
-        .map_err(|e| e.to_string())
-        .and_then(|s| toml::from_str(&s).map_err(|e| e.to_string()))
-        .unwrap_or_else(|e| fatal(&format!("{path}: {e}")));
-    let pass = match (&cfg.pass, &cfg.pass_cmd) {
-        (Some(p), _) => p.clone(),
-        (None, Some(cmd)) => {
+    // before the flags are parsed, so `.env` feeds clap's env fallbacks
+    let _ = dotenvy::dotenv();
+    let cfg = Config::parse();
+    let pass = match (env::var("MAILARCHIVE_PASS").ok(), &cfg.pass_cmd) {
+        (Some(p), _) if !p.is_empty() => p,
+        (_, Some(cmd)) => {
             let out = Command::new("sh").arg("-c").arg(cmd).output().unwrap_or_else(|e| fatal(&e.to_string()));
+            if !out.status.success() {
+                fatal(&format!("--pass-cmd failed: {}", String::from_utf8_lossy(&out.stderr).trim_end()));
+            }
             String::from_utf8_lossy(&out.stdout).trim_end().to_string()
         }
-        _ => fatal("config needs `pass` or `pass_cmd`"),
+        _ => fatal("no password: set MAILARCHIVE_PASS or pass --pass-cmd"),
     };
     let root = expand_home(&cfg.maildir);
     loop {
@@ -84,7 +127,7 @@ fn run(cfg: &Config, pass: &str, root: &Path) -> Result<()> {
         .list(None, Some("*"))?
         .iter()
         .filter(|n| !n.attributes().contains(&NameAttribute::NoSelect))
-        .filter(|n| cfg.folders.as_ref().is_none_or(|f| f.iter().any(|x| x == n.name())))
+        .filter(|n| cfg.folders.is_empty() || cfg.folders.iter().any(|x| x == n.name()))
         .map(|n| {
             let delim = n.delimiter().unwrap_or("/");
             (n.name().to_string(), n.name().split(delim).fold(root.to_path_buf(), |p, c| p.join(c)))
@@ -96,7 +139,7 @@ fn run(cfg: &Config, pass: &str, root: &Path) -> Result<()> {
         for (name, dir) in &folders {
             // after an INBOX event only INBOX is synced; on timeout everything is
             if idle_inbox || name == "INBOX" {
-                sync_folder(&mut s, name, dir)?;
+                sync_folder(&mut s, cfg, name, dir)?;
             }
         }
         s.examine("INBOX")?;
@@ -107,7 +150,7 @@ fn run(cfg: &Config, pass: &str, root: &Path) -> Result<()> {
 }
 
 /// Bring one local Maildir in line with the remote folder.
-fn sync_folder(s: &mut Sess, name: &str, dir: &Path) -> Result<()> {
+fn sync_folder(s: &mut Sess, cfg: &Config, name: &str, dir: &Path) -> Result<()> {
     for sub in ["cur", "new", "tmp"] {
         fs::create_dir_all(dir.join(sub))?;
     }
@@ -120,14 +163,18 @@ fn sync_folder(s: &mut Sess, name: &str, dir: &Path) -> Result<()> {
     let mut st = state.lines().map(|l| l.trim().parse::<u32>().unwrap_or(0));
     let (old_uv, mut last_uid) = (st.next().unwrap_or(0), st.next().unwrap_or(0));
 
-    let mut local = scan_local(dir)?;
+    let local = scan_local(dir)?;
+    // A changed UIDVALIDITY invalidates every local UID, but that is never a reason to
+    // delete mail: the server may have been migrated or the folder recreated. Refuse to
+    // touch the folder and let the operator decide (move the directory aside, then let the
+    // next run refetch it into a fresh one).
     if old_uv != uv && !local.is_empty() {
-        eprintln!("{name}: UIDVALIDITY changed ({old_uv} -> {uv}), resetting folder");
-        for p in local.values() {
-            fs::remove_file(p)?;
-        }
-        local.clear();
-        last_uid = 0;
+        eprintln!(
+            "{name}: UIDVALIDITY changed ({old_uv} -> {uv}) - folder left untouched. \
+             Move {} aside (or fix .uidvalidity) to resume syncing it.",
+            dir.display()
+        );
+        return Ok(());
     }
 
     // remote uid -> maildir flags
@@ -140,20 +187,24 @@ fn sync_folder(s: &mut Sess, name: &str, dir: &Path) -> Result<()> {
         }
     }
 
-    // deletions and flag changes
-    let mut removed = 0;
+    // vanished messages and flag changes
+    let (mut removed, mut orphans) = (0, 0);
     for (uid, path) in &local {
         match remote.get(uid) {
-            None => {
+            None if cfg.expunge => {
                 fs::remove_file(path)?;
                 removed += 1;
             }
-            Some(flags) => {
+            // gone upstream but kept here - that is the point of an archive
+            None => orphans += 1,
+            Some(flags) if cfg.sync_flags => {
                 let want = dir.join(if flags.contains('S') { "cur" } else { "new" }).join(file_name(uv, *uid, flags));
                 if *path != want {
-                    fs::rename(path, want)?;
+                    fs::rename(path, &want)?;
+                    fsync_dir(want.parent().unwrap_or(dir))?;
                 }
             }
+            Some(_) => {}
         }
     }
 
@@ -168,8 +219,8 @@ fn sync_folder(s: &mut Sess, name: &str, dir: &Path) -> Result<()> {
             let flags = maildir_flags(f.flags());
             let fname = file_name(uv, uid, &flags);
             let tmp = dir.join("tmp").join(&fname);
-            fs::write(&tmp, body)?;
-            fs::rename(&tmp, dir.join(if flags.contains('S') { "cur" } else { "new" }).join(&fname))?;
+            let dst = dir.join(if flags.contains('S') { "cur" } else { "new" }).join(&fname);
+            write_durable(&tmp, &dst, body)?;
             last_uid = last_uid.max(uid);
             added += 1;
         }
@@ -177,10 +228,32 @@ fn sync_folder(s: &mut Sess, name: &str, dir: &Path) -> Result<()> {
     if let Some(m) = remote.keys().max() {
         last_uid = last_uid.max(*m);
     }
-    fs::write(&state_file, format!("{uv}\n{last_uid}\n"))?;
+    // only now that every message body is on disk may the state advance
+    let state_tmp = dir.join(".uidvalidity.tmp");
+    write_durable(&state_tmp, &state_file, format!("{uv}\n{last_uid}\n").as_bytes())?;
     if added + removed > 0 || old_uv != uv {
-        eprintln!("{name}: +{added} -{removed} (total {})", remote.len());
+        let kept = if orphans > 0 { format!(" ~{orphans} kept") } else { String::new() };
+        eprintln!("{name}: +{added} -{removed}{kept} (total {})", remote.len());
     }
+    Ok(())
+}
+
+/// Write `data` to `tmp` and move it to `dst` so that the name only ever becomes visible
+/// once the content is on stable storage: fsync the file before the rename, fsync the
+/// containing directory after it. Without this a power cut leaves correctly named but empty
+/// files, and since the UID is part of the name they would never be fetched again.
+fn write_durable(tmp: &Path, dst: &Path, data: &[u8]) -> Result<()> {
+    let mut f = fs::File::create(tmp)?;
+    f.write_all(data)?;
+    f.sync_all()?;
+    drop(f);
+    fs::rename(tmp, dst)?;
+    fsync_dir(dst.parent().unwrap_or(Path::new(".")))
+}
+
+/// fsync a directory so a rename into it survives a crash.
+fn fsync_dir(dir: &Path) -> Result<()> {
+    fs::File::open(dir)?.sync_all()?;
     Ok(())
 }
 
