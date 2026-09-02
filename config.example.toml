@@ -1,0 +1,17 @@
+host = "imap.example.com"
+port = 993
+user = "me@example.com"
+pass = "secret"
+# alternatively a command that prints the password:
+# pass_cmd = "pass show mail/example"
+
+# local Maildir root ("~" is expanded)
+maildir = "~/Mail/example"
+
+# tls = false   # plain TCP, only for local/test servers
+
+# optional: only sync these folders (default: all)
+# folders = ["INBOX", "Sent"]
+
+# seconds to wait in IDLE on INBOX before a full re-sync of all folders
+idle_secs = 1500

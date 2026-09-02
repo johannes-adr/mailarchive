@@ -1,0 +1,16 @@
+[package]
+name = "mailarchive"
+version = "0.1.0"
+edition = "2021"
+description = "Tiny incremental, IDLE-driven IMAP -> Maildir sync (like mbsync)"
+
+[dependencies]
+imap = "3.0.0-alpha.15"
+imap-proto = "0.16"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
