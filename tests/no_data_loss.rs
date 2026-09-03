@@ -95,14 +95,19 @@ fn serve(stream: TcpStream, srv: Arc<Server>, done: mpsc::Sender<usize>, log: Ar
             }
             for (i, (uid, body)) in msgs.iter().enumerate().filter(|(_, (u, _))| wants(u)) {
                 let seq = i + 1;
+                // one uid, one day in January 2020 - see `internal_date`
+                let date = match upper.contains("INTERNALDATE") {
+                    true => format!(" INTERNALDATE \"{uid:02}-Jan-2020 00:00:00 +0000\""),
+                    false => String::new(),
+                };
                 if with_body {
                     let _ = w.write_all(
-                        format!("* {seq} FETCH (UID {uid} FLAGS (\\Seen) BODY[] {{{}}}\r\n", body.len()).as_bytes(),
+                        format!("* {seq} FETCH (UID {uid} FLAGS (\\Seen){date} BODY[] {{{}}}\r\n", body.len()).as_bytes(),
                     );
                     let _ = w.write_all(body.as_bytes());
                     out(&mut w, ")");
                 } else {
-                    out(&mut w, &format!("* {seq} FETCH (UID {uid} FLAGS (\\Seen))"));
+                    out(&mut w, &format!("* {seq} FETCH (UID {uid} FLAGS (\\Seen){date})"));
                 }
             }
             out(&mut w, &format!("{tag} OK FETCH done"));
@@ -164,10 +169,18 @@ fn prepare_root(tag: &str, port: u16) -> PathBuf {
 }
 
 fn start_in(root: PathBuf, accounts: &str) -> Run {
+    start_in_with(root, accounts, "")
+}
+
+/// `extra` = more top level config fields, e.g. `, "backfill_dates": true`.
+fn start_in_with(root: PathBuf, accounts: &str, extra: &str) -> Run {
     let cfg_path = root.join("config.json");
     std::fs::write(
         &cfg_path,
-        format!(r#"{{"maildir": {root:?}, "idle_secs": 1, "accounts": [{accounts}]}}"#, root = root.to_str().unwrap()),
+        format!(
+            r#"{{"maildir": {root:?}, "idle_secs": 1{extra}, "accounts": [{accounts}]}}"#,
+            root = root.to_str().unwrap()
+        ),
     )
     .unwrap();
     let errlog = root.join("stderr.log");
@@ -365,4 +378,70 @@ fn login_failure_is_reported_not_hammered() {
     assert!(run.stderr().contains("AUTHENTICATIONFAILED"), "{}", run.stderr());
     assert!(run.stderr().contains("reconnecting in 30s"), "{}", run.stderr());
     assert_eq!(*log.conns.lock().unwrap(), 1, "no second LOGIN within the delay");
+}
+
+/// The date the scripted server reports for a uid, as a unix timestamp.
+fn internal_date(uid: i64) -> i64 {
+    // 01-Jan-2020 00:00:00 +0000, one day per uid
+    1_577_836_800 + (uid - 1) * 86_400
+}
+
+fn mtime(path: &Path) -> i64 {
+    let t = std::fs::metadata(path).unwrap().modified().unwrap();
+    t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
+}
+
+fn only_file(dir: &Path, sub: &str) -> PathBuf {
+    let mut v: Vec<PathBuf> = std::fs::read_dir(dir.join(sub)).unwrap().map(|e| e.unwrap().path()).collect();
+    v.sort();
+    v.remove(0)
+}
+
+/// A stored message must carry the server's INTERNALDATE as its mtime: an IMAP server
+/// serving this Maildir reports that mtime as the message date, so the fetch time would
+/// show every archived mail as having arrived during the sync.
+#[test]
+fn stored_mail_keeps_the_date_the_server_reports() {
+    let (port, rx, _) = spawn_server(one_inbox(vec![(100, vec![(3, "Subject: one\r\n\r\nbody one")])]));
+    let run = start("dates", port, "");
+    assert_eq!(wait_rounds(&rx, 1), vec![0]);
+
+    let file = only_file(&run.dir("acc", "INBOX"), "cur");
+    assert_eq!(mtime(&file), internal_date(3), "{}", file.display());
+}
+
+/// `backfill_dates` repairs an archive written before that: it re-reads INTERNALDATE for the
+/// messages already on disk. It runs once per folder (`.dates_backfilled`), so leaving the
+/// option on does not re-fetch the dates on every pass.
+#[test]
+fn backfill_dates_repairs_an_older_archive() {
+    let (port, rx, log) = spawn_server(one_inbox(vec![(100, vec![(1, "Subject: one\r\n\r\nbody one")])]));
+    let root = prepare_root("backfill", port);
+
+    // an archive as an older version left it: the file carries the time it was downloaded
+    let run = start_in(root.clone(), &account("acc", port, ""));
+    assert_eq!(wait_rounds(&rx, 1), vec![0]);
+    let dir = run.dir("acc", "INBOX");
+    let file = only_file(&dir, "cur");
+    drop(run);
+    let wrong: i64 = 1_700_000_000;
+    std::fs::File::options()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH + Duration::from_secs(wrong as u64)))
+        .unwrap();
+    assert_eq!(mtime(&file), wrong);
+
+    let run = start_in_with(root, &account("acc", port, ""), r#", "backfill_dates": true"#);
+    assert!(!wait_rounds(&rx, 2).is_empty());
+    assert_eq!(mtime(&file), internal_date(1), "the date must come back from the server");
+    assert!(dir.join(".dates_backfilled").exists(), "the folder is marked as repaired");
+    assert!(run.stderr().contains("1 message date(s) restored"), "{}", run.stderr());
+
+    // second pass: marked, so no further INTERNALDATE fetch for the whole folder
+    let before = log.cmds.lock().unwrap().iter().filter(|c| c.contains("INTERNALDATE")).count();
+    assert!(!wait_rounds(&rx, 1).is_empty());
+    let after = log.cmds.lock().unwrap().iter().filter(|c| c.contains("INTERNALDATE")).count();
+    assert_eq!(before, after, "a repaired folder is not re-read");
 }

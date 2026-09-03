@@ -6,6 +6,7 @@ use imap::types::Flag;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, UNIX_EPOCH};
 use std::{fs, path::Component};
 
 /// Maildir file name; the `,U=<uid>` part is what mbsync uses too.
@@ -70,13 +71,48 @@ pub fn scan(dir: &Path) -> Result<HashMap<u32, PathBuf>> {
 /// once the content is on stable storage: fsync the file before the rename, fsync the
 /// containing directory after it. Without this a power cut leaves correctly named but empty
 /// files, and since the UID is part of the name they would never be fetched again.
-pub fn write_durable(tmp: &Path, dst: &Path, data: &[u8]) -> Result<()> {
+///
+/// `mtime` (a unix timestamp) is applied before the fsync, so the published file already
+/// carries the message's own date: IMAP servers report a Maildir message's date from the
+/// file's mtime, so leaving it at the time of the fetch would show every archived message
+/// as having arrived when it was downloaded.
+pub fn write_durable(tmp: &Path, dst: &Path, data: &[u8], mtime: Option<i64>) -> Result<()> {
     let mut f = fs::File::create(tmp)?;
     f.write_all(data)?;
+    if let Some(secs) = mtime {
+        f.set_times(times(secs))?;
+    }
     f.sync_all()?;
     drop(f);
     fs::rename(tmp, dst)?;
     fsync_dir(parent(dst))
+}
+
+/// Set the mtime of a message already on disk to the unix timestamp `secs`.
+pub fn set_mtime(path: &Path, secs: i64) -> Result<()> {
+    // write access: `set_times` needs it on some platforms, opening read-only would work
+    // only on unix
+    fs::File::options().write(true).open(path)?.set_times(times(secs))?;
+    Ok(())
+}
+
+/// Access and modification time from a unix timestamp; timestamps before 1970 (a mail with
+/// a bogus date) work too.
+fn times(secs: i64) -> fs::FileTimes {
+    let t = match secs {
+        0.. => UNIX_EPOCH + Duration::from_secs(secs as u64),
+        _ => UNIX_EPOCH - Duration::from_secs(secs.unsigned_abs()),
+    };
+    fs::FileTimes::new().set_accessed(t).set_modified(t)
+}
+
+/// mtime of a message as a unix timestamp, `None` if it cannot be read.
+pub fn mtime(path: &Path) -> Option<i64> {
+    let t = fs::metadata(path).ok()?.modified().ok()?;
+    Some(match t.duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_secs() as i64,
+        Err(e) => -(e.duration().as_secs() as i64),
+    })
 }
 
 /// Rename within the Maildir (a flag change), durably.
@@ -148,8 +184,11 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         create(&dir).unwrap();
         let dst = dir.join("cur").join(file_name(1, 42, "S"));
-        write_durable(&dir.join("tmp").join("x"), &dst, b"body").unwrap();
+        write_durable(&dir.join("tmp").join("x"), &dst, b"body", Some(1_600_000_000)).unwrap();
         assert_eq!(fs::read(&dst).unwrap(), b"body");
+        assert_eq!(mtime(&dst), Some(1_600_000_000), "the message keeps its own date, not the fetch time");
+        set_mtime(&dst, -86_400).unwrap();
+        assert_eq!(mtime(&dst), Some(-86_400), "dates before 1970 survive too");
         assert_eq!(scan(&dir).unwrap().keys().copied().collect::<Vec<_>>(), vec![42]);
         assert!(!dir.join("tmp").join("x").exists(), "tmp file is moved, not copied");
         fs::remove_dir_all(&dir).unwrap();

@@ -2,6 +2,10 @@
   // "~" is expanded; every account gets a directory below it
   "maildir": "~/Mail",
   "idle_secs": 1500,
+  // einmalig auf true setzen, wenn ein altes Archiv noch die Download-Zeit als Dateidatum
+  // trägt; jeder Ordner wird genau einmal repariert (.dates_backfilled), danach kann die
+  // Option wieder raus
+  "backfill_dates": false,
   "accounts": [
     {
       "name": "web.de",
