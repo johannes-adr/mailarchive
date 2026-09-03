@@ -28,7 +28,7 @@ pub struct Account {
     pub user: String,
     /// Password in the file itself - least preferred, keep the file mode 0600.
     pub pass: Option<String>,
-    /// Name of an env var holding the password (a `.env` next to the binary is read too).
+    /// Name of an env var holding the password (a `.env` in the working directory is read too).
     pub pass_env: Option<String>,
     /// Command printing the password on stdout; wins over the other two.
     pub pass_cmd: Option<String>,
@@ -73,12 +73,21 @@ impl Config {
             if self.accounts[..i].iter().any(|b| b.name == a.name) {
                 return Err(format!("duplicate account name {:?}", a.name).into());
             }
+            // two accounts on the implicit env fallback must not read the same variable
+            if a.pass.is_none() && a.pass_env.is_none() && a.pass_cmd.is_none() {
+                let var = a.default_pass_env();
+                if self.accounts[..i].iter().any(|b| {
+                    b.pass.is_none() && b.pass_env.is_none() && b.pass_cmd.is_none() && b.default_pass_env() == var
+                }) {
+                    return Err(format!("accounts {:?} and another both fall back to {var}; set pass_env", a.name).into());
+                }
+            }
         }
         Ok(())
     }
 
     /// Maildir root with a leading `~/` expanded.
-    pub fn root(&self) -> PathBuf {
+    pub fn root(&self) -> Result<PathBuf> {
         expand_home(&self.maildir)
     }
 }
@@ -96,7 +105,11 @@ impl Account {
                 )
                 .into());
             }
-            return Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string());
+            let p = String::from_utf8_lossy(&out.stdout).trim_end_matches(['\r', '\n']).to_string();
+            if p.is_empty() {
+                return Err(format!("{}: pass_cmd printed nothing", self.name).into());
+            }
+            return Ok(p);
         }
         if let Some(var) = &self.pass_env {
             return env::var(var).map_err(|_| format!("{}: env var {var} is not set", self.name).into());
@@ -121,10 +134,14 @@ impl Account {
     }
 }
 
-pub fn expand_home(p: &str) -> PathBuf {
+/// `~/x` -> `$HOME/x`; an unset HOME is an error rather than a silent relative path.
+pub fn expand_home(p: &str) -> Result<PathBuf> {
     match p.strip_prefix("~/") {
-        Some(rest) => PathBuf::from(env::var("HOME").unwrap_or_default()).join(rest),
-        None => PathBuf::from(p),
+        Some(rest) => {
+            let home = env::var("HOME").map_err(|_| format!("{p}: HOME is not set"))?;
+            Ok(PathBuf::from(home).join(rest))
+        }
+        None => Ok(PathBuf::from(p)),
     }
 }
 
@@ -152,6 +169,11 @@ mod tests {
         assert!(parse(r#"{"maildir":"/m","accounts":[
             {"name":"a","host":"h","user":"u"},{"name":"a","host":"h","user":"u"}]}"#).is_err());
         assert!(parse(r#"{"maildir":"/m","accounts":[]}"#).is_err());
+        // "web.de" and "web-de" would both read MAILARCHIVE_PASS_WEB_DE
+        assert!(parse(r#"{"maildir":"/m","accounts":[
+            {"name":"web.de","host":"h","user":"u"},{"name":"web-de","host":"h","user":"u"}]}"#).is_err());
+        assert!(parse(r#"{"maildir":"/m","accounts":[
+            {"name":"web.de","host":"h","user":"u","pass":"p"},{"name":"web-de","host":"h","user":"u"}]}"#).is_ok());
         // a typo must not be silently ignored
         assert!(parse(r#"{"maildir":"/m","idlesecs":5,"accounts":[{"name":"a","host":"h","user":"u"}]}"#).is_err());
     }
@@ -160,6 +182,7 @@ mod tests {
     fn password_sources_have_a_precedence() {
         let mut a: Account = serde_json::from_str(r#"{"name":"web.de","host":"h","user":"u"}"#).unwrap();
         assert_eq!(a.default_pass_env(), "MAILARCHIVE_PASS_WEB_DE");
+        env::remove_var("MAILARCHIVE_PASS_WEB_DE");
         assert!(a.password().is_err());
 
         a.pass = Some("from-file".into());
@@ -170,5 +193,18 @@ mod tests {
 
         a.pass_cmd = Some("exit 1".into());
         assert!(a.password().is_err(), "a failing pass_cmd must not fall through to `pass`");
+
+        a.pass_cmd = Some("true".into());
+        assert!(a.password().is_err(), "a pass_cmd printing nothing is an error, not an empty password");
+    }
+
+    #[test]
+    fn home_must_be_set_for_tilde() {
+        env::set_var("HOME", "/h");
+        assert_eq!(expand_home("~/Mail").unwrap(), PathBuf::from("/h/Mail"));
+        assert_eq!(expand_home("/abs").unwrap(), PathBuf::from("/abs"));
+        env::remove_var("HOME");
+        assert!(expand_home("~/Mail").is_err());
+        env::set_var("HOME", "/h");
     }
 }

@@ -7,22 +7,32 @@ eventbasiert (IMAP IDLE), für beliebig viele Accounts.
   Verbindung und einen eigenen Thread: `<maildir>/<name>/INBOX/{cur,new,tmp}`.
 - Jeder IMAP-Ordner wird lokal ein Maildir, verschachtelt nach der Server-Hierarchie
   (`Archive/2024` → `<name>/Archive/2024/`).
-- Mails werden unverändert als Text (RFC 5322) gespeichert, Dateiname mbsync-kompatibel
-  (`…,U=<uid>:2,<flags>`).
-- Pro Ordner merkt sich `.uidvalidity` UIDVALIDITY und höchste UID; Flags werden
-  gespiegelt (`sync_flags`, Standard an).
+- Mails werden unverändert als Text (RFC 5322) gespeichert, Dateiname im mbsync-Stil
+  (`…,U=<uid>:2,<flags>`); `U=` ist hier die IMAP-UID. Ein fremdes Maildir (Dateien ohne
+  `.uidvalidity`) wird deshalb weder übernommen noch angefasst, nur gemeldet.
+- Pro Ordner merkt sich `.uidvalidity`, zu welcher UIDVALIDITY die UIDs im Verzeichnis
+  gehören; sie wird beim ersten Kontakt geschrieben, damit eine abgebrochene Erst-Sync beim
+  nächsten Lauf weiterläuft. Was fehlt, ergibt sich aus dem Vergleich Verzeichnis ↔ Server
+  (`UID FETCH 1:*`), Flags werden gespiegelt (`sync_flags`, Standard an).
 - **Archiv, kein Spiegel:** verschwindet eine Mail serverseitig, bleibt die lokale Kopie
-  liegen. Nur mit `"expunge": true` wird sie auch lokal gelöscht.
+  liegen. Nur mit `"expunge": true` wird sie auch lokal gelöscht — und auch dann nur, wenn
+  der Server tatsächlich Mails aufgezählt hat; ein bloßes `0 EXISTS` leert das Archiv nie
+  (ein absichtlich geleerter Ordner wird lokal also nie geleert).
 - Ändert sich UIDVALIDITY, wird der Ordner **nicht** angefasst (kein Neuholen, kein
   Löschen) und eine Warnung ausgegeben — die Entscheidung trifft der Mensch: Ordner
   beiseite schieben, dann holt der nächste Lauf ihn frisch.
 - Jede Mail wird nach `tmp/` geschrieben, `fsync`t und erst dann unter ihren endgültigen
-  Namen verschoben (Verzeichnis-`fsync` inklusive); die Statusdatei wird erst danach
-  aktualisiert. Ein Stromausfall kann so keine leeren Dateien mit gültigem Namen
-  hinterlassen.
+  Namen verschoben (Verzeichnis-`fsync` inklusive). Ein Stromausfall kann so keine leeren
+  Dateien mit gültigem Namen hinterlassen.
+- Ein Ordner, den der Server nicht öffnen lässt (`NO`/`BAD`, z.B. Shared Folder ohne
+  Rechte), wird mit Meldung übersprungen, die übrigen laufen weiter. Ordner, deren Name
+  kein gültiges Verzeichnis unterhalb des Accounts ergibt oder mit einem anderen
+  kollidiert, ebenso.
 - Nach dem Sync wartet jeder Account per IDLE auf seiner INBOX; bei Ereignis wird die INBOX
-  sofort synchronisiert, nach Ablauf von `idle_secs` alle Ordner. Verbindungsabbrüche →
-  Reconnect.
+  sofort synchronisiert, nach Ablauf von `idle_secs` alle Ordner (inkl. neu angelegter).
+  Verbindungsabbrüche → Reconnect mit Backoff (30 s … 15 min bei sofortigem Scheitern,
+  z.B. falschem Passwort). Außerhalb von IDLE gilt ein Socket-Timeout von 120 s, damit
+  eine halboffene Verbindung den Account nicht ewig blockiert.
 
 ## Nutzung
 
@@ -49,8 +59,9 @@ Accounts).
 ```
 
 Pro Account: `name` (auch der Verzeichnisname), `host`, `user`, optional `port` (993),
-`tls` (true), `folders` (leer = alle), `expunge` (false), `sync_flags` (true). Unbekannte
-Felder sind ein Fehler, damit Tippfehler nicht still ignoriert werden.
+`tls` (true = implizites TLS wie auf Port 993; STARTTLS wird nicht unterstützt), `folders`
+(leer = alle), `expunge` (false), `sync_flags` (true). Unbekannte Felder sind ein Fehler,
+damit Tippfehler nicht still ignoriert werden; ebenso ein `--account`, den es nicht gibt.
 
 Das Passwort kommt aus `pass_cmd` (Kommando, das es ausgibt) > `pass_env` (Name einer
 Umgebungsvariable) > `pass` (direkt in der Datei, dann `chmod 600`) > `MAILARCHIVE_PASS_<NAME>`.
@@ -65,5 +76,7 @@ Eine `.env` im Arbeitsverzeichnis wird vor dem Lesen der Config geladen.
 | `src/sync.rs` | Verbindung, IDLE-Schleife, Ordner-Sync |
 | `src/maildir.rs` | Dateinamen, Flags, `scan`, durable writes |
 
-`cargo test` fährt den echten Binary gegen zwei Fake-IMAP-Server und prüft, dass nichts
-gelöscht wird; dazu Unit-Tests für Config und Maildir.
+`cargo test` fährt den echten Binary gegen gescriptete Fake-IMAP-Server: verschwundene
+Mails bleiben, UIDVALIDITY-Wechsel löscht nichts, abgebrochene Erst-Sync läuft weiter,
+kaputte Ordner blockieren die anderen nicht, `0 EXISTS` leert nichts, Login-Fehler werden
+nicht gehämmert; dazu Unit-Tests für Config, Maildir-Pfade und Backoff.

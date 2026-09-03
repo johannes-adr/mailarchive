@@ -96,15 +96,22 @@ fn parent(p: &Path) -> &Path {
 }
 
 /// Turn an IMAP folder name into a path below `root`, one directory per hierarchy level.
-/// Components that would escape `root` (`.`, `..`, absolute parts) are dropped - a folder
-/// name comes from the server and must never steer writes out of the Maildir.
-pub fn folder_path(root: &Path, name: &str, delim: &str) -> PathBuf {
-    name.split(delim)
-        .filter(|c| !c.is_empty())
-        .fold(root.to_path_buf(), |p, c| match Path::new(c).components().next() {
-            Some(Component::Normal(seg)) if Path::new(c).components().count() == 1 => p.join(seg),
-            _ => p,
-        })
+/// A flat namespace (no delimiter) nests on `/`, since that cannot be a directory name
+/// anyway. Both name and delimiter come from the server and must never steer writes out
+/// of the Maildir or onto another folder's directory, so a name with an empty, `.`, `..`,
+/// absolute, or slash-containing component is rejected (`None`) instead of silently
+/// folded onto a neighbour.
+pub fn folder_path(root: &Path, name: &str, delim: Option<&str>) -> Option<PathBuf> {
+    let delim = delim.filter(|d| !d.is_empty()).unwrap_or("/");
+    let mut p = root.to_path_buf();
+    for c in name.split(delim) {
+        let mut comps = Path::new(c).components();
+        match (comps.next(), comps.next()) {
+            (Some(Component::Normal(seg)), None) if seg != "." && seg != ".." => p.push(seg),
+            _ => return None,
+        }
+    }
+    (p != root).then_some(p)
 }
 
 #[cfg(test)]
@@ -120,12 +127,19 @@ mod tests {
     }
 
     #[test]
-    fn folder_paths_stay_below_the_root() {
+    fn folder_paths_stay_below_the_root_or_are_rejected() {
         let root = Path::new("/m/acct");
-        assert_eq!(folder_path(root, "Archive/2024", "/"), Path::new("/m/acct/Archive/2024"));
-        assert_eq!(folder_path(root, "Archive.2024", "."), Path::new("/m/acct/Archive/2024"));
-        assert_eq!(folder_path(root, "../../etc", "/"), Path::new("/m/acct/etc"));
-        assert_eq!(folder_path(root, "/abs/x", "/"), Path::new("/m/acct/abs/x"));
+        let ok = |n, d| folder_path(root, n, d).unwrap();
+        assert_eq!(ok("Archive/2024", Some("/")), Path::new("/m/acct/Archive/2024"));
+        assert_eq!(ok("Archive.2024", Some(".")), Path::new("/m/acct/Archive/2024"));
+        assert_eq!(ok("a/b", None), Path::new("/m/acct/a/b"), "flat namespace nests on '/'");
+        assert_eq!(ok("a/b", Some("")), Path::new("/m/acct/a/b"), "empty delimiter = flat");
+        // anything that would leave the root, land on the root itself, or need a '/' inside
+        // one directory name is refused, never folded onto a neighbour
+        for (n, d) in [("../../etc", Some("/")), ("/abs/x", Some("/")), ("..", Some("/")), (".", Some("/")),
+                       ("INBOX/..", Some("/")), ("", Some("/")), ("a//b", Some("/")), ("a/b", Some("."))] {
+            assert!(folder_path(root, n, d).is_none(), "{n:?} with {d:?}");
+        }
     }
 
     #[test]

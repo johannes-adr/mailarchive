@@ -314,6 +314,7 @@ dependencies = [
  "dotenvy",
  "imap",
  "imap-proto",
+ "native-tls",
  "serde",
  "serde_json",
 ]
