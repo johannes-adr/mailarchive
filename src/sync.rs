@@ -200,8 +200,9 @@ fn reconcile_existing(
 }
 
 /// Fetch messages not yet on disk, in small batches, each written via tmp/ then renamed and
-/// handed to the `mail_received` hook. Returns (added, missing), where missing counts uids the server listed but returned
-/// without a body; they stay absent locally and are retried on the next pass.
+/// handed to the `mail_received` hook. Returns (added, missing), where missing counts uids
+/// the server listed but returned without a body; they stay absent locally and are retried
+/// on the next pass.
 fn fetch_new(
     s: &mut Sess,
     cfg: &Config,
