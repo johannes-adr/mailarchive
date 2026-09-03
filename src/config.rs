@@ -1,4 +1,4 @@
-//! The JSON config file and how an account's password is obtained.
+//! The JSON config file (comments allowed), how an account's password is obtained, and hooks.
 
 use crate::Result;
 use serde::Deserialize;
@@ -15,6 +15,17 @@ pub struct Config {
     #[serde(default = "default_idle")]
     pub idle_secs: u64,
     pub accounts: Vec<Account>,
+    #[serde(default)]
+    pub hooks: Hooks,
+}
+
+/// Shell commands run on events. `%%mail_path%%` in a command is replaced by the path of the
+/// message, already shell-quoted, so it needs no quotes of its own.
+#[derive(Deserialize, Debug, Default)]
+#[serde(deny_unknown_fields)]
+pub struct Hooks {
+    /// Runs after a message has been stored on disk (during the first sync for every message).
+    pub mail_received: Option<String>,
 }
 
 /// One IMAP account. `name` is also its directory name below the Maildir root.
@@ -55,7 +66,12 @@ fn default_true() -> bool { true }
 impl Config {
     pub fn load(path: &Path) -> Result<Config> {
         let text = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let cfg: Config = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+        Config::parse(&text).map_err(|e| format!("{}: {e}", path.display()).into())
+    }
+
+    /// JSON with `//` and `/* */` comments allowed.
+    fn parse(text: &str) -> Result<Config> {
+        let cfg: Config = serde_json::from_reader(json_comments::StripComments::new(text.as_bytes()))?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -134,6 +150,21 @@ impl Account {
     }
 }
 
+impl Hooks {
+    /// Run `mail_received` for the message at `path`. A failing hook is logged, never fatal:
+    /// the message is already safely on disk.
+    pub fn on_mail_received(&self, path: &Path) {
+        let Some(cmd) = &self.mail_received else { return };
+        let quoted = format!("'{}'", path.to_string_lossy().replace('\'', r"'\''"));
+        let cmd = cmd.replace("%%mail_path%%", &quoted);
+        match Command::new("sh").arg("-c").arg(&cmd).status() {
+            Ok(st) if st.success() => {}
+            Ok(st) => eprintln!("hook mail_received: {cmd}: {st}"),
+            Err(e) => eprintln!("hook mail_received: {cmd}: {e}"),
+        }
+    }
+}
+
 /// `~/x` -> `$HOME/x`; an unset HOME is an error rather than a silent relative path.
 pub fn expand_home(p: &str) -> Result<PathBuf> {
     match p.strip_prefix("~/") {
@@ -149,16 +180,17 @@ pub fn expand_home(p: &str) -> Result<PathBuf> {
 mod tests {
     use super::*;
 
+    use std::fs;
+
     fn parse(s: &str) -> Result<Config> {
-        let c: Config = serde_json::from_str(s)?;
-        c.validate()?;
-        Ok(c)
+        Config::parse(s)
     }
 
     #[test]
     fn defaults_fill_in_and_names_must_be_directory_safe() {
         let c = parse(r#"{"maildir":"/m","accounts":[{"name":"web.de","host":"h","user":"u","pass":"p"}]}"#).unwrap();
         assert_eq!(c.idle_secs, 1500);
+        assert!(c.hooks.mail_received.is_none());
         let a = &c.accounts[0];
         assert_eq!((a.port, a.tls, a.expunge, a.sync_flags), (993, true, false, true));
 
@@ -176,6 +208,26 @@ mod tests {
             {"name":"web.de","host":"h","user":"u","pass":"p"},{"name":"web-de","host":"h","user":"u"}]}"#).is_ok());
         // a typo must not be silently ignored
         assert!(parse(r#"{"maildir":"/m","idlesecs":5,"accounts":[{"name":"a","host":"h","user":"u"}]}"#).is_err());
+    }
+
+    #[test]
+    fn comments_are_allowed_and_hooks_run_with_the_quoted_path() {
+        let c = parse(r#"{
+            // where mail goes
+            "maildir": "/m", /* idle_secs left at default */
+            "accounts": [{"name": "a", "host": "h", "user": "u", "pass": "p"}],
+            "hooks": {"mail_received": "printf %s %%mail_path%% > $OUT"}
+        }"#).unwrap();
+        assert_eq!(c.hooks.mail_received.as_deref(), Some("printf %s %%mail_path%% > $OUT"));
+
+        let out = env::temp_dir().join(format!("mailarchive-hook-{}", std::process::id()));
+        env::set_var("OUT", &out);
+        // spaces and a quote in the path survive the shell
+        c.hooks.on_mail_received(Path::new("/m/a/it's/cur/1 2"));
+        assert_eq!(fs::read_to_string(&out).unwrap(), "/m/a/it's/cur/1 2");
+        fs::remove_file(out).unwrap();
+        // unknown hook names are typos
+        assert!(parse(r#"{"maildir":"/m","accounts":[{"name":"a","host":"h","user":"u"}],"hooks":{"mail_recieved":"x"}}"#).is_err());
     }
 
     #[test]
