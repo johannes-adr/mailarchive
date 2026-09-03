@@ -1,0 +1,35 @@
+# Release builds for every push to main (as workflow artifacts) and for v* tags (as a GitHub
+# Release with the binaries attached).
+name: release
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, name: linux-amd64 }
+          - { os: macos-latest, target: aarch64-apple-darwin, name: macos-arm64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --release --target ${{ matrix.target }}
+      - run: cp target/${{ matrix.target }}/release/mailarchive mailarchive-${{ matrix.name }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mailarchive-${{ matrix.name }}
+          path: mailarchive-${{ matrix.name }}
+      - if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: mailarchive-${{ matrix.name }}

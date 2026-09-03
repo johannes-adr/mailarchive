@@ -71,6 +71,12 @@ Das Passwort kommt aus `pass_cmd` (Kommando, das es ausgibt) > `pass_env` (Name 
 Umgebungsvariable) > `pass` (direkt in der Datei, dann `chmod 600`) > `MAILARCHIVE_PASS_<NAME>`.
 Eine `.env` im Arbeitsverzeichnis wird vor dem Lesen der Config geladen.
 
+## Releases
+
+Jeder Push auf `main` baut Release-Binaries für Linux amd64 und macOS arm64 (Apple Silicon)
+als Workflow-Artefakte; ein Tag `v*` hängt sie zusätzlich an ein GitHub Release. Das
+Linux-Binary linkt OpenSSL dynamisch (`libssl.so.3`).
+
 ## Aufbau
 
 | Datei | Inhalt |
