@@ -1,0 +1,22 @@
+{
+  "maildir": "~/Mail",
+  "idle_secs": 1500,
+  "accounts": [
+    {
+      "name": "web.de",
+      "host": "imap.web.de",
+      "port": 993,
+      "user": "me@web.de",
+      "pass_env": "WEBDE_PASS"
+    },
+    {
+      "name": "gmail",
+      "host": "imap.gmail.com",
+      "user": "me@gmail.com",
+      "pass_cmd": "pass show mail/gmail",
+      "folders": ["INBOX", "[Gmail]/Sent Mail"],
+      "expunge": false,
+      "sync_flags": true
+    }
+  ]
+}

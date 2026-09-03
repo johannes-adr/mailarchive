@@ -1,62 +1,92 @@
-//! mailarchive: tiny incremental, IDLE-driven IMAP -> Maildir sync (like mbsync, pull-only).
-//!
-//! Every IMAP folder becomes a Maildir (`cur/`, `new/`, `tmp/`) below the configured root,
-//! nested according to the server's hierarchy delimiter. Messages are stored verbatim as
-//! RFC 5322 text. Per folder a `.uidvalidity` file remembers UIDVALIDITY and the highest
-//! UID seen, so every run only fetches what is new; flags and deletions are mirrored too.
+//! CLI entry point: read the JSON config, then run one thread per account.
 
-use imap_proto::NameAttribute;
-use imap::types::Flag;
-use imap::{extensions::idle::WaitOutcome, Connection, ConnectionMode, Session};
-use serde::Deserialize;
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::time::Duration;
-use std::{env, fs, process::Command, thread};
+use clap::Parser;
+use mailarchive::config::{expand_home, Config};
+use mailarchive::sync;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+use std::thread;
 
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-type Sess = Session<Connection>;
+/// Incremental, IDLE-driven IMAP -> Maildir archive for any number of accounts.
+#[derive(Parser)]
+#[command(version, about, after_help = "\
+Each account in the config becomes <maildir>/<name>/, with one directory per IMAP folder
+below it. Passwords come from `pass_cmd`, `pass_env`, `pass`, or MAILARCHIVE_PASS_<NAME>;
+a `.env` in the working directory is loaded before the config is read.")]
+struct Cli {
+    /// JSON config file listing the accounts
+    #[arg(short = 'c', long, env = "MAILARCHIVE_CONFIG", default_value = "config.json")]
+    input_config: PathBuf,
 
-#[derive(Deserialize)]
-struct Config {
-    host: String,
-    #[serde(default = "default_port")]
-    port: u16,
-    user: String,
-    pass: Option<String>,
-    pass_cmd: Option<String>,
-    maildir: String,
-    /// false = plain TCP without TLS (local/test servers only)
-    #[serde(default = "default_tls")]
-    tls: bool,
-    folders: Option<Vec<String>>,
-    #[serde(default = "default_idle")]
-    idle_secs: u64,
+    /// Override the Maildir root from the config
+    #[arg(long, env = "MAILARCHIVE_MAILDIR")]
+    maildir: Option<String>,
+
+    /// Only run these accounts (comma separated; default: all)
+    #[arg(long, value_delimiter = ',')]
+    account: Vec<String>,
 }
-fn default_port() -> u16 { 993 }
-fn default_idle() -> u64 { 1500 }
-fn default_tls() -> bool { true }
 
 fn main() {
-    let path = env::args().nth(1).unwrap_or_else(|| "config.toml".into());
-    let cfg: Config = fs::read_to_string(&path)
-        .map_err(|e| e.to_string())
-        .and_then(|s| toml::from_str(&s).map_err(|e| e.to_string()))
-        .unwrap_or_else(|e| fatal(&format!("{path}: {e}")));
-    let pass = match (&cfg.pass, &cfg.pass_cmd) {
-        (Some(p), _) => p.clone(),
-        (None, Some(cmd)) => {
-            let out = Command::new("sh").arg("-c").arg(cmd).output().unwrap_or_else(|e| fatal(&e.to_string()));
-            String::from_utf8_lossy(&out.stdout).trim_end().to_string()
+    // before the config is read, so `pass_env` can resolve against it; only the working
+    // directory's .env, never a parent's
+    let _ = dotenvy::from_path(".env");
+    let cli = Cli::parse();
+    let cfg = Config::load(&cli.input_config).unwrap_or_else(|e| fatal(&e.to_string()));
+    let root = match &cli.maildir {
+        Some(m) => expand_home(m),
+        None => cfg.root(),
+    }
+    .unwrap_or_else(|e| fatal(&e.to_string()));
+
+    for n in &cli.account {
+        if !cfg.accounts.iter().any(|a| &a.name == n) {
+            fatal(&format!("no account named {n:?} in {}", cli.input_config.display()));
         }
-        _ => fatal("config needs `pass` or `pass_cmd`"),
-    };
-    let root = expand_home(&cfg.maildir);
-    loop {
-        if let Err(e) = run(&cfg, &pass, &root) {
-            eprintln!("error: {e}; reconnecting in 30s");
-            thread::sleep(Duration::from_secs(30));
+    }
+
+    let accounts: Vec<_> = cfg
+        .accounts
+        .iter()
+        .filter(|a| cli.account.is_empty() || cli.account.iter().any(|n| n == &a.name))
+        .collect();
+    // fail before connecting anything if a password source is broken
+    let passwords: Vec<String> = accounts
+        .iter()
+        .map(|a| a.password().unwrap_or_else(|e| fatal(&e.to_string())))
+        .collect();
+
+    // one connection, one IDLE loop, one thread per account
+    thread::scope(|scope| {
+        for (acc, pass) in accounts.iter().zip(&passwords) {
+            let dir = root.join(&acc.name);
+            scope.spawn(move || {
+                let mut prev = None;
+                loop {
+                    let started = Instant::now();
+                    if let Err(e) = sync::run(acc, pass, &dir, cfg.idle_secs) {
+                        let delay = next_delay(prev, started.elapsed());
+                        eprintln!("{}: error: {e}; reconnecting in {}s", acc.name, delay.as_secs());
+                        thread::sleep(delay);
+                        prev = Some(delay);
+                    }
+                }
+            });
         }
+    });
+}
+
+const MIN_DELAY: Duration = Duration::from_secs(30);
+const MAX_DELAY: Duration = Duration::from_secs(15 * 60);
+
+/// Reconnect delay after a failed connection. `prev` is the delay used last time (None on
+/// the first failure). A connection that lived a while was working, so start over at the
+/// minimum; one that died at once (bad password, refused) doubles the previous delay, so a
+/// wrong credential does not hammer the provider into a lockout.
+fn next_delay(prev: Option<Duration>, lived: Duration) -> Duration {
+    match prev {
+        Some(p) if lived <= Duration::from_secs(120) => (p * 2).min(MAX_DELAY),
+        _ => MIN_DELAY,
     }
 }
 
@@ -65,163 +95,21 @@ fn fatal(msg: &str) -> ! {
     std::process::exit(1)
 }
 
-fn expand_home(p: &str) -> PathBuf {
-    match p.strip_prefix("~/") {
-        Some(rest) => PathBuf::from(env::var("HOME").unwrap_or_default()).join(rest),
-        None => PathBuf::from(p),
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// One connection lifetime: full sync, then loop IDLE on INBOX -> sync.
-fn run(cfg: &Config, pass: &str, root: &Path) -> Result<()> {
-    let mode = if cfg.tls { ConnectionMode::AutoTls } else { ConnectionMode::Plaintext };
-    let client = imap::ClientBuilder::new(&cfg.host, cfg.port).mode(mode).connect()?;
-    let mut s = client.login(&cfg.user, pass).map_err(|(e, _)| e)?;
-    eprintln!("connected to {}", cfg.host);
-
-    // (imap name, local path) for every selectable folder, optionally filtered by config.
-    let folders: Vec<(String, PathBuf)> = s
-        .list(None, Some("*"))?
-        .iter()
-        .filter(|n| !n.attributes().contains(&NameAttribute::NoSelect))
-        .filter(|n| cfg.folders.as_ref().is_none_or(|f| f.iter().any(|x| x == n.name())))
-        .map(|n| {
-            let delim = n.delimiter().unwrap_or("/");
-            (n.name().to_string(), n.name().split(delim).fold(root.to_path_buf(), |p, c| p.join(c)))
-        })
-        .collect();
-
-    let mut idle_inbox = true;
-    loop {
-        for (name, dir) in &folders {
-            // after an INBOX event only INBOX is synced; on timeout everything is
-            if idle_inbox || name == "INBOX" {
-                sync_folder(&mut s, name, dir)?;
-            }
+    #[test]
+    fn reconnect_backs_off_only_for_immediate_failures() {
+        let s = Duration::from_secs;
+        let mut prev = None;
+        let mut seen = vec![];
+        for _ in 0..8 {
+            let d = next_delay(prev, s(1));
+            seen.push(d.as_secs());
+            prev = Some(d);
         }
-        s.examine("INBOX")?;
-        let mut h = s.idle();
-        h.timeout(Duration::from_secs(cfg.idle_secs)).keepalive(false);
-        idle_inbox = h.wait_while(imap::extensions::idle::stop_on_any)? == WaitOutcome::TimedOut;
+        assert_eq!(seen, [30, 60, 120, 240, 480, 900, 900, 900]);
+        assert_eq!(next_delay(Some(s(900)), s(3600)), MIN_DELAY, "a long-lived connection resets the backoff");
     }
-}
-
-/// Bring one local Maildir in line with the remote folder.
-fn sync_folder(s: &mut Sess, name: &str, dir: &Path) -> Result<()> {
-    for sub in ["cur", "new", "tmp"] {
-        fs::create_dir_all(dir.join(sub))?;
-    }
-    let mb = s.examine(name)?;
-    let uv = mb.uid_validity.unwrap_or(0);
-
-    // state: "<uidvalidity>\n<last uid>"
-    let state_file = dir.join(".uidvalidity");
-    let state = fs::read_to_string(&state_file).unwrap_or_default();
-    let mut st = state.lines().map(|l| l.trim().parse::<u32>().unwrap_or(0));
-    let (old_uv, mut last_uid) = (st.next().unwrap_or(0), st.next().unwrap_or(0));
-
-    let mut local = scan_local(dir)?;
-    if old_uv != uv && !local.is_empty() {
-        eprintln!("{name}: UIDVALIDITY changed ({old_uv} -> {uv}), resetting folder");
-        for p in local.values() {
-            fs::remove_file(p)?;
-        }
-        local.clear();
-        last_uid = 0;
-    }
-
-    // remote uid -> maildir flags
-    let mut remote: HashMap<u32, String> = HashMap::new();
-    if mb.exists > 0 {
-        for f in s.uid_fetch("1:*", "(UID FLAGS)")?.iter() {
-            if let Some(uid) = f.uid {
-                remote.insert(uid, maildir_flags(f.flags()));
-            }
-        }
-    }
-
-    // deletions and flag changes
-    let mut removed = 0;
-    for (uid, path) in &local {
-        match remote.get(uid) {
-            None => {
-                fs::remove_file(path)?;
-                removed += 1;
-            }
-            Some(flags) => {
-                let want = dir.join(if flags.contains('S') { "cur" } else { "new" }).join(file_name(uv, *uid, flags));
-                if *path != want {
-                    fs::rename(path, want)?;
-                }
-            }
-        }
-    }
-
-    // new messages, fetched in small batches, written via tmp/ then renamed
-    let mut new: Vec<u32> = remote.keys().copied().filter(|u| !local.contains_key(u)).collect();
-    new.sort_unstable();
-    let mut added = 0;
-    for chunk in new.chunks(25) {
-        let set = chunk.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
-        for f in s.uid_fetch(set, "(UID FLAGS BODY.PEEK[])")?.iter() {
-            let (Some(uid), Some(body)) = (f.uid, f.body()) else { continue };
-            let flags = maildir_flags(f.flags());
-            let fname = file_name(uv, uid, &flags);
-            let tmp = dir.join("tmp").join(&fname);
-            fs::write(&tmp, body)?;
-            fs::rename(&tmp, dir.join(if flags.contains('S') { "cur" } else { "new" }).join(&fname))?;
-            last_uid = last_uid.max(uid);
-            added += 1;
-        }
-    }
-    if let Some(m) = remote.keys().max() {
-        last_uid = last_uid.max(*m);
-    }
-    fs::write(&state_file, format!("{uv}\n{last_uid}\n"))?;
-    if added + removed > 0 || old_uv != uv {
-        eprintln!("{name}: +{added} -{removed} (total {})", remote.len());
-    }
-    Ok(())
-}
-
-/// Maildir file name; the `,U=<uid>` part is what mbsync uses too.
-fn file_name(uv: u32, uid: u32, flags: &str) -> String {
-    format!("{uv}.{uid}.mailarchive,U={uid}:2,{flags}")
-}
-
-/// Map IMAP system flags to Maildir info letters (sorted, as the spec requires).
-fn maildir_flags(flags: &[Flag]) -> String {
-    let mut v: Vec<char> = flags
-        .iter()
-        .filter_map(|f| match f {
-            Flag::Draft => Some('D'),
-            Flag::Flagged => Some('F'),
-            Flag::Answered => Some('R'),
-            Flag::Seen => Some('S'),
-            Flag::Deleted => Some('T'),
-            _ => None,
-        })
-        .collect();
-    v.sort_unstable();
-    v.into_iter().collect()
-}
-
-/// uid -> path for all messages in cur/ and new/.
-fn scan_local(dir: &Path) -> Result<HashMap<u32, PathBuf>> {
-    let mut m = HashMap::new();
-    for sub in ["cur", "new"] {
-        for e in fs::read_dir(dir.join(sub))? {
-            let p = e?.path();
-            let uid = p
-                .file_name()
-                .and_then(|n| n.to_str())
-                .and_then(|n| n.split(",U=").nth(1))
-                .and_then(|r| r.split(':').next())
-                .and_then(|u| u.parse().ok());
-            if let Some(uid) = uid {
-                m.insert(uid, p);
-            }
-        }
-    }
-    Ok(m)
 }
