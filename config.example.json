@@ -1,4 +1,5 @@
 {
+  // "~" is expanded; every account gets a directory below it
   "maildir": "~/Mail",
   "idle_secs": 1500,
   "accounts": [
@@ -18,5 +19,9 @@
       "expunge": false,
       "sync_flags": true
     }
-  ]
+  ],
+  // shell commands run on events; %%mail_path%% is the (already quoted) path of the message
+  "hooks": {
+    "mail_received": "notmuch new && notify-send \"Neue Mail\" %%mail_path%%"
+  }
 }

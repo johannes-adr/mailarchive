@@ -28,6 +28,9 @@ eventbasiert (IMAP IDLE), für beliebig viele Accounts.
   Rechte), wird mit Meldung übersprungen, die übrigen laufen weiter. Ordner, deren Name
   kein gültiges Verzeichnis unterhalb des Accounts ergibt oder mit einem anderen
   kollidiert, ebenso.
+- **Hooks:** `hooks.mail_received` ist ein Shell-Kommando, das nach jeder gespeicherten Mail
+  läuft (auch beim Erst-Sync für jede Mail); `%%mail_path%%` wird durch den bereits
+  shell-quotierten Pfad ersetzt. Ein fehlschlagender Hook wird nur gemeldet.
 - Nach dem Sync wartet jeder Account per IDLE auf seiner INBOX; bei Ereignis wird die INBOX
   sofort synchronisiert, nach Ablauf von `idle_secs` alle Ordner (inkl. neu angelegter).
   Verbindungsabbrüche → Reconnect mit Backoff (30 s … 15 min bei sofortigem Scheitern,
@@ -48,13 +51,14 @@ Accounts).
 
 ### Config
 
-```json
+```jsonc
 {
-  "maildir": "~/Mail",
+  "maildir": "~/Mail", // Kommentare (// und /* */) sind erlaubt
   "idle_secs": 1500,
   "accounts": [
     { "name": "web.de", "host": "imap.web.de", "user": "me@web.de", "pass_env": "WEBDE_PASS" }
-  ]
+  ],
+  "hooks": { "mail_received": "notmuch new && notify-send Mail %%mail_path%%" }
 }
 ```
 
@@ -72,11 +76,11 @@ Eine `.env` im Arbeitsverzeichnis wird vor dem Lesen der Config geladen.
 | Datei | Inhalt |
 | --- | --- |
 | `src/main.rs` | CLI, Config laden, ein Thread pro Account |
-| `src/config.rs` | JSON-Config, Validierung, Passwortquellen |
+| `src/config.rs` | JSON-Config (mit Kommentaren), Validierung, Passwortquellen, Hooks |
 | `src/sync.rs` | Verbindung, IDLE-Schleife, Ordner-Sync |
 | `src/maildir.rs` | Dateinamen, Flags, `scan`, durable writes |
 
 `cargo test` fährt den echten Binary gegen gescriptete Fake-IMAP-Server: verschwundene
 Mails bleiben, UIDVALIDITY-Wechsel löscht nichts, abgebrochene Erst-Sync läuft weiter,
 kaputte Ordner blockieren die anderen nicht, `0 EXISTS` leert nichts, Login-Fehler werden
-nicht gehämmert; dazu Unit-Tests für Config, Maildir-Pfade und Backoff.
+nicht gehämmert; dazu Unit-Tests für Config (inkl. Kommentare und Hooks), Maildir-Pfade und Backoff.

@@ -1,7 +1,7 @@
 //! One account's connection lifetime: full sync, then IDLE on INBOX, and the per-folder
 //! sync that keeps the local Maildir in line with the server.
 
-use crate::config::Account;
+use crate::config::{Account, Config};
 use crate::maildir;
 use crate::Result;
 use imap::{extensions::idle::WaitOutcome, Connection, Session};
@@ -19,7 +19,7 @@ const IO_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Connect, sync every folder, then loop: IDLE on INBOX -> sync. Returns only on error,
 /// which the caller turns into a reconnect.
-pub fn run(acc: &Account, pass: &str, root: &Path, idle_secs: u64) -> Result<()> {
+pub fn run(cfg: &Config, acc: &Account, pass: &str, root: &Path) -> Result<()> {
     let (client, socket) = connect(acc)?;
     let mut s = client.login(&acc.user, pass).map_err(|(e, _)| e)?;
     eprintln!("{}: connected to {}", acc.name, acc.host);
@@ -30,12 +30,12 @@ pub fn run(acc: &Account, pass: &str, root: &Path, idle_secs: u64) -> Result<()>
         // re-LIST on every full pass so folders created server-side show up
         for (name, dir) in folders(&mut s, acc, root)? {
             if sync_all || name == "INBOX" {
-                sync_folder(&mut s, acc, &name, &dir).or_else(|e| skip_if_folder_error(acc, &name, e))?;
+                sync_folder(&mut s, cfg, acc, &name, &dir).or_else(|e| skip_if_folder_error(acc, &name, e))?;
             }
         }
         s.examine("INBOX")?;
         let mut h = s.idle();
-        h.timeout(Duration::from_secs(idle_secs)).keepalive(false);
+        h.timeout(Duration::from_secs(cfg.idle_secs)).keepalive(false);
         sync_all = h.wait_while(imap::extensions::idle::stop_on_any)? == WaitOutcome::TimedOut;
         // IDLE clears the read timeout when it returns; put ours back
         socket.set_read_timeout(Some(IO_TIMEOUT))?;
@@ -102,7 +102,7 @@ fn folders(s: &mut Sess, acc: &Account, root: &Path) -> Result<Vec<(String, Path
 }
 
 /// Bring one local Maildir in line with the remote folder.
-fn sync_folder(s: &mut Sess, acc: &Account, name: &str, dir: &Path) -> Result<()> {
+fn sync_folder(s: &mut Sess, cfg: &Config, acc: &Account, name: &str, dir: &Path) -> Result<()> {
     maildir::create(dir)?;
     let mb = s.examine(name)?;
     let uv = mb.uid_validity.ok_or("server reported no UIDVALIDITY")?;
@@ -131,7 +131,7 @@ fn sync_folder(s: &mut Sess, acc: &Account, name: &str, dir: &Path) -> Result<()
 
     let remote = remote_flags(s, mb.exists)?;
     let (removed, orphans) = reconcile_existing(acc, dir, uv, &local, &remote)?;
-    let (added, missing) = fetch_new(s, dir, uv, &local, &remote)?;
+    let (added, missing) = fetch_new(s, cfg, dir, uv, &local, &remote)?;
 
     if missing > 0 {
         eprintln!("{}/{name}: {missing} message(s) returned without a body, will retry", acc.name);
@@ -199,11 +199,12 @@ fn reconcile_existing(
     Ok((removed, orphans))
 }
 
-/// Fetch messages not yet on disk, in small batches, each written via tmp/ then renamed.
-/// Returns (added, missing), where missing counts uids the server listed but returned
+/// Fetch messages not yet on disk, in small batches, each written via tmp/ then renamed and
+/// handed to the `mail_received` hook. Returns (added, missing), where missing counts uids the server listed but returned
 /// without a body; they stay absent locally and are retried on the next pass.
 fn fetch_new(
     s: &mut Sess,
+    cfg: &Config,
     dir: &Path,
     uv: u32,
     local: &HashMap<u32, PathBuf>,
@@ -221,6 +222,7 @@ fn fetch_new(
             let dst = dir.join(maildir::subdir(&flags)).join(maildir::file_name(uv, uid, &flags));
             // tmp name without flags, so a retry after a flag change reuses the same file
             maildir::write_durable(&dir.join("tmp").join(format!("{uv}.{uid}")), &dst, body)?;
+            cfg.hooks.on_mail_received(&dst);
             got += 1;
         }
         added += got;

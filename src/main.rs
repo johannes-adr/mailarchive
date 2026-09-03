@@ -14,7 +14,7 @@ Each account in the config becomes <maildir>/<name>/, with one directory per IMA
 below it. Passwords come from `pass_cmd`, `pass_env`, `pass`, or MAILARCHIVE_PASS_<NAME>;
 a `.env` in the working directory is loaded before the config is read.")]
 struct Cli {
-    /// JSON config file listing the accounts
+    /// JSON config file listing the accounts (comments allowed)
     #[arg(short = 'c', long, env = "MAILARCHIVE_CONFIG", default_value = "config.json")]
     input_config: PathBuf,
 
@@ -59,12 +59,12 @@ fn main() {
     // one connection, one IDLE loop, one thread per account
     thread::scope(|scope| {
         for (acc, pass) in accounts.iter().zip(&passwords) {
-            let dir = root.join(&acc.name);
+            let (cfg, dir) = (&cfg, root.join(&acc.name));
             scope.spawn(move || {
                 let mut prev = None;
                 loop {
                     let started = Instant::now();
-                    if let Err(e) = sync::run(acc, pass, &dir, cfg.idle_secs) {
+                    if let Err(e) = sync::run(cfg, acc, pass, &dir) {
                         let delay = next_delay(prev, started.elapsed());
                         eprintln!("{}: error: {e}; reconnecting in {}s", acc.name, delay.as_secs());
                         thread::sleep(delay);
