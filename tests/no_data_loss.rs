@@ -1,6 +1,7 @@
-//! Drives the real binary against a scripted IMAP server to pin the archive guarantees:
-//! a message that disappears upstream stays on disk, and a UIDVALIDITY change deletes
-//! nothing. The server speaks just enough IMAP for one folder.
+//! Drives the real binary against two scripted IMAP servers to pin the archive guarantees:
+//! a message that disappears upstream stays on disk, a UIDVALIDITY change deletes nothing,
+//! and both accounts land in their own directory. The servers speak just enough IMAP for
+//! one folder.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -85,6 +86,19 @@ fn serve(stream: TcpStream, rounds: Vec<Round>, done: mpsc::Sender<usize>) {
     }
 }
 
+/// Bind a scripted server on a free port; the receiver yields a round number whenever that
+/// round's sync is finished (the client has reached IDLE).
+fn spawn_server(rounds: Vec<Round>) -> (u16, mpsc::Receiver<usize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let (sock, _) = listener.accept().unwrap();
+        serve(sock, rounds, tx);
+    });
+    (port, rx)
+}
+
 struct Kill(Child);
 impl Drop for Kill {
     fn drop(&mut self) {
@@ -104,35 +118,46 @@ fn names(dir: &Path) -> Vec<String> {
 }
 
 /// Round 0 fetches two messages, round 1 loses uid 2 upstream, round 2 changes UIDVALIDITY.
+/// Round 0 fetches two messages, round 1 loses uid 2 upstream, round 2 changes UIDVALIDITY.
+/// A second account runs alongside to pin the per-account directory layout.
 #[test]
 fn keeps_mail_that_vanishes_upstream_and_survives_uidvalidity_change() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let (sock, _) = listener.accept().unwrap();
-        serve(
-            sock,
-            vec![
-                Round { uidvalidity: 100, msgs: vec![(1, "Subject: one\r\n\r\nbody one"), (2, "Subject: two\r\n\r\nbody two")] },
-                Round { uidvalidity: 100, msgs: vec![(1, "Subject: one\r\n\r\nbody one")] },
-                Round { uidvalidity: 200, msgs: vec![(7, "Subject: new\r\n\r\nafter migration")] },
-            ],
-            tx,
-        );
-    });
+    let (port, rx) = spawn_server(vec![
+        Round { uidvalidity: 100, msgs: vec![(1, "Subject: one\r\n\r\nbody one"), (2, "Subject: two\r\n\r\nbody two")] },
+        Round { uidvalidity: 100, msgs: vec![(1, "Subject: one\r\n\r\nbody one")] },
+        Round { uidvalidity: 200, msgs: vec![(7, "Subject: new\r\n\r\nafter migration")] },
+    ]);
+    let (port2, rx2) = spawn_server(vec![Round {
+        uidvalidity: 5,
+        msgs: vec![(3, "Subject: elsewhere\r\n\r\nsecond account")],
+    }]);
 
     let root = std::env::temp_dir().join(format!("mailarchive-test-{port}"));
     let _ = std::fs::remove_dir_all(&root);
-    let inbox = root.join("INBOX");
+    std::fs::create_dir_all(&root).unwrap();
+    let inbox = root.join("web.de").join("INBOX");
+
+    let cfg_path = root.join("config.json");
+    std::fs::write(
+        &cfg_path,
+        format!(
+            r#"{{
+              "maildir": {root:?},
+              "idle_secs": 1,
+              "accounts": [
+                {{"name": "web.de", "host": "127.0.0.1", "port": {port}, "user": "u",
+                  "pass": "p", "tls": false}},
+                {{"name": "other", "host": "127.0.0.1", "port": {port2}, "user": "u",
+                  "pass": "p", "tls": false}}
+              ]
+            }}"#,
+            root = root.to_str().unwrap()
+        ),
+    )
+    .unwrap();
 
     let bin = PathBuf::from(env!("CARGO_BIN_EXE_mailarchive"));
-    let child = Command::new(bin)
-        .args(["--host", "127.0.0.1", "--port", &port.to_string(), "--user", "u",
-               "--maildir", root.to_str().unwrap(), "--tls", "false", "--idle-secs", "1"])
-        .env("MAILARCHIVE_PASS", "p")
-        .spawn()
-        .unwrap();
+    let child = Command::new(bin).args(["--input-config", cfg_path.to_str().unwrap()]).spawn().unwrap();
     let _kill = Kill(child);
 
     // wait for each round to reach IDLE, i.e. its sync is finished
@@ -165,4 +190,10 @@ fn keeps_mail_that_vanishes_upstream_and_survives_uidvalidity_change() {
         let p = ["cur", "new"].iter().map(|s| inbox.join(s).join(&f)).find(|p| p.exists()).unwrap();
         assert!(!std::fs::read(&p).unwrap().is_empty(), "{f} is empty");
     }
+
+    // the second account synced into its own directory, untouched by the first
+    rx2.recv_timeout(Duration::from_secs(10)).expect("second account never synced");
+    let other = names(&root.join("other").join("INBOX"));
+    assert_eq!(other.len(), 1, "second account has its own mail: {other:?}");
+    assert!(other[0].contains(",U=3"));
 }
