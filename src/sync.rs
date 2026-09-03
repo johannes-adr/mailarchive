@@ -24,31 +24,33 @@ pub fn run(acc: &Account, pass: &str, root: &Path, idle_secs: u64) -> Result<()>
     let mut s = client.login(&acc.user, pass).map_err(|(e, _)| e)?;
     eprintln!("{}: connected to {}", acc.name, acc.host);
 
-    let mut full = true;
+    // The first pass and every IDLE timeout sync all folders; an INBOX event syncs only INBOX.
+    let mut sync_all = true;
     loop {
         // re-LIST on every full pass so folders created server-side show up
         for (name, dir) in folders(&mut s, acc, root)? {
-            // after an INBOX event only INBOX is synced; on timeout everything is
-            if !(full || name == "INBOX") {
-                continue;
-            }
-            if let Err(e) = sync_folder(&mut s, acc, &name, &dir) {
-                match e.downcast_ref::<imap::Error>() {
-                    // a tagged NO/BAD (no permission, vanished folder) is this folder's
-                    // problem only; the session is still in sync, so carry on
-                    Some(imap::Error::No(_) | imap::Error::Bad(_)) => {
-                        eprintln!("{}/{name}: skipped: {e}", acc.name)
-                    }
-                    _ => return Err(e),
-                }
+            if sync_all || name == "INBOX" {
+                sync_folder(&mut s, acc, &name, &dir).or_else(|e| skip_if_folder_error(acc, &name, e))?;
             }
         }
         s.examine("INBOX")?;
         let mut h = s.idle();
         h.timeout(Duration::from_secs(idle_secs)).keepalive(false);
-        full = h.wait_while(imap::extensions::idle::stop_on_any)? == WaitOutcome::TimedOut;
+        sync_all = h.wait_while(imap::extensions::idle::stop_on_any)? == WaitOutcome::TimedOut;
         // IDLE clears the read timeout when it returns; put ours back
         socket.set_read_timeout(Some(IO_TIMEOUT))?;
+    }
+}
+
+/// A tagged NO/BAD (no permission, vanished folder) is this folder's problem only; the
+/// session is still in sync, so log and carry on. Anything else ends the connection.
+fn skip_if_folder_error(acc: &Account, name: &str, e: Box<dyn std::error::Error>) -> Result<()> {
+    match e.downcast_ref::<imap::Error>() {
+        Some(imap::Error::No(_) | imap::Error::Bad(_)) => {
+            eprintln!("{}/{name}: skipped: {e}", acc.name);
+            Ok(())
+        }
+        _ => Err(e),
     }
 }
 
@@ -80,9 +82,9 @@ fn folders(s: &mut Sess, acc: &Account, root: &Path) -> Result<Vec<(String, Path
     let mut taken = HashSet::new();
     let mut out = Vec::new();
     for n in s.list(None, Some("*"))?.iter() {
-        if n.attributes().contains(&NameAttribute::NoSelect)
-            || !(acc.folders.is_empty() || acc.folders.iter().any(|x| x == n.name()))
-        {
+        let selectable = !n.attributes().contains(&NameAttribute::NoSelect);
+        let wanted = acc.folders.is_empty() || acc.folders.iter().any(|x| x == n.name());
+        if !(selectable && wanted) {
             continue;
         }
         match maildir::folder_path(root, n.name(), n.delimiter()) {
@@ -105,18 +107,15 @@ fn sync_folder(s: &mut Sess, acc: &Account, name: &str, dir: &Path) -> Result<()
     let mb = s.examine(name)?;
     let uv = mb.uid_validity.ok_or("server reported no UIDVALIDITY")?;
 
-    // state: "<uidvalidity>\n" - which epoch the ,U= numbers in this directory belong to
-    let state_file = dir.join(".uidvalidity");
-    let state = std::fs::read_to_string(&state_file).unwrap_or_default();
-    let old_uv = state.lines().next().and_then(|l| l.trim().parse::<u32>().ok());
-
     let local = maildir::scan(dir)?;
-    // A changed UIDVALIDITY invalidates every local UID, but that is never a reason to
-    // delete mail: the server may have been migrated or the folder recreated. Refuse to
-    // touch the folder and let the operator decide (move the directory aside, then the
-    // next run refetches it into a fresh one). The same applies to a directory that holds
-    // mail but no state file: its UIDs are of unknown origin.
-    if old_uv != Some(uv) && !local.is_empty() {
+    let old_uv = read_uidvalidity(dir);
+    let new_epoch = old_uv != Some(uv);
+    if new_epoch && !local.is_empty() {
+        // A changed UIDVALIDITY invalidates every local UID, but that is never a reason to
+        // delete mail: the server may have been migrated or the folder recreated. Refuse to
+        // touch the folder and let the operator decide (move the directory aside, then the
+        // next run refetches it into a fresh one). The same applies to a directory that
+        // holds mail but no state file: its UIDs are of unknown origin.
         let why = match old_uv {
             Some(o) => format!("UIDVALIDITY changed ({o} -> {uv})"),
             None => format!("no .uidvalidity but {} messages present", local.len()),
@@ -124,25 +123,62 @@ fn sync_folder(s: &mut Sess, acc: &Account, name: &str, dir: &Path) -> Result<()
         eprintln!("{}/{name}: {why} - folder left untouched. Move {} aside to resume syncing it.", acc.name, dir.display());
         return Ok(());
     }
-    if old_uv != Some(uv) {
+    if new_epoch {
         // first contact with this epoch: record it now, so an interrupted first sync
         // resumes next time instead of looking like a foreign directory
-        maildir::write_durable(&dir.join(".uidvalidity.tmp"), &state_file, format!("{uv}\n").as_bytes())?;
+        write_uidvalidity(dir, uv)?;
     }
 
-    // remote uid -> maildir flags
-    let mut remote: HashMap<u32, String> = HashMap::new();
-    if mb.exists > 0 {
+    let remote = remote_flags(s, mb.exists)?;
+    let (removed, orphans) = reconcile_existing(acc, dir, uv, &local, &remote)?;
+    let (added, missing) = fetch_new(s, dir, uv, &local, &remote)?;
+
+    if missing > 0 {
+        eprintln!("{}/{name}: {missing} message(s) returned without a body, will retry", acc.name);
+    }
+    if added + removed > 0 || new_epoch {
+        let kept = if orphans > 0 { format!(" ~{orphans} kept") } else { String::new() };
+        eprintln!("{}/{name}: +{added} -{removed}{kept} (total {})", acc.name, remote.len());
+    }
+    Ok(())
+}
+
+/// The `.uidvalidity` state file: "<uidvalidity>\n" - which epoch the ,U= numbers in this
+/// directory belong to. `None` if absent or unreadable.
+fn read_uidvalidity(dir: &Path) -> Option<u32> {
+    let state = std::fs::read_to_string(dir.join(".uidvalidity")).unwrap_or_default();
+    state.lines().next().and_then(|l| l.trim().parse().ok())
+}
+
+fn write_uidvalidity(dir: &Path, uv: u32) -> Result<()> {
+    maildir::write_durable(&dir.join(".uidvalidity.tmp"), &dir.join(".uidvalidity"), format!("{uv}\n").as_bytes())
+}
+
+/// remote uid -> maildir flags for every message in the selected folder.
+fn remote_flags(s: &mut Sess, exists: u32) -> Result<HashMap<u32, String>> {
+    let mut remote = HashMap::new();
+    if exists > 0 {
         for f in s.uid_fetch("1:*", "(UID FLAGS)")?.iter() {
             if let Some(uid) = f.uid {
                 remote.insert(uid, maildir::flags_of(f.flags()));
             }
         }
     }
+    Ok(remote)
+}
 
-    // vanished messages and flag changes
+/// Handle messages already on disk: delete the ones that vanished upstream (only under
+/// `expunge`), rename on flag changes (only under `sync_flags`). Returns (removed, orphans),
+/// where an orphan is a message gone upstream but kept here - that is the point of an archive.
+fn reconcile_existing(
+    acc: &Account,
+    dir: &Path,
+    uv: u32,
+    local: &HashMap<u32, PathBuf>,
+    remote: &HashMap<u32, String>,
+) -> Result<(usize, usize)> {
     let (mut removed, mut orphans) = (0, 0);
-    for (uid, path) in &local {
+    for (uid, path) in local {
         match remote.get(uid) {
             // only trust "gone" when the server actually enumerated something; a bare
             // `0 EXISTS` must not empty the archive
@@ -150,7 +186,6 @@ fn sync_folder(s: &mut Sess, acc: &Account, name: &str, dir: &Path) -> Result<()
                 std::fs::remove_file(path)?;
                 removed += 1;
             }
-            // gone upstream but kept here - that is the point of an archive
             None => orphans += 1,
             Some(flags) if acc.sync_flags => {
                 let want = dir.join(maildir::subdir(flags)).join(maildir::file_name(uv, *uid, flags));
@@ -161,8 +196,19 @@ fn sync_folder(s: &mut Sess, acc: &Account, name: &str, dir: &Path) -> Result<()
             Some(_) => {}
         }
     }
+    Ok((removed, orphans))
+}
 
-    // new messages, fetched in small batches, written via tmp/ then renamed
+/// Fetch messages not yet on disk, in small batches, each written via tmp/ then renamed.
+/// Returns (added, missing), where missing counts uids the server listed but returned
+/// without a body; they stay absent locally and are retried on the next pass.
+fn fetch_new(
+    s: &mut Sess,
+    dir: &Path,
+    uv: u32,
+    local: &HashMap<u32, PathBuf>,
+    remote: &HashMap<u32, String>,
+) -> Result<(usize, usize)> {
     let mut new: Vec<u32> = remote.keys().copied().filter(|u| !local.contains_key(u)).collect();
     new.sort_unstable();
     let (mut added, mut missing) = (0, 0);
@@ -180,12 +226,5 @@ fn sync_folder(s: &mut Sess, acc: &Account, name: &str, dir: &Path) -> Result<()
         added += got;
         missing += chunk.len().saturating_sub(got);
     }
-    if missing > 0 {
-        eprintln!("{}/{name}: {missing} message(s) returned without a body, will retry", acc.name);
-    }
-    if added + removed > 0 || old_uv != Some(uv) {
-        let kept = if orphans > 0 { format!(" ~{orphans} kept") } else { String::new() };
-        eprintln!("{}/{name}: +{added} -{removed}{kept} (total {})", acc.name, remote.len());
-    }
-    Ok(())
+    Ok((added, missing))
 }
