@@ -15,9 +15,6 @@ pub struct Config {
     #[serde(default = "default_idle")]
     pub idle_secs: u64,
     pub accounts: Vec<Account>,
-    /// One-off repair of message dates written by older versions; see `crate::backfill`.
-    #[serde(default)]
-    pub backfill_dates: bool,
     #[serde(default)]
     pub hooks: Hooks,
 }
@@ -193,7 +190,6 @@ mod tests {
     fn defaults_fill_in_and_names_must_be_directory_safe() {
         let c = parse(r#"{"maildir":"/m","accounts":[{"name":"web.de","host":"h","user":"u","pass":"p"}]}"#).unwrap();
         assert_eq!(c.idle_secs, 1500);
-        assert!(!c.backfill_dates);
         assert!(c.hooks.mail_received.is_none());
         let a = &c.accounts[0];
         assert_eq!((a.port, a.tls, a.expunge, a.sync_flags), (993, true, false, true));

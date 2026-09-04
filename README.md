@@ -59,20 +59,12 @@ Accounts).
 {
   "maildir": "~/Mail", // Kommentare (// und /* */) sind erlaubt
   "idle_secs": 1500,
-  "backfill_dates": false, // einmalige Datums-Reparatur für alte Archive
   "accounts": [
     { "name": "web.de", "host": "imap.web.de", "user": "me@web.de", "pass_env": "WEBDE_PASS" }
   ],
   "hooks": { "mail_received": "notmuch new && notify-send Mail %%mail_path%%" }
 }
 ```
-
-`backfill_dates` (Standard `false`) ist eine einmalige Reparatur für Archive, die noch mit
-der Download-Zeit als mtime geschrieben wurden: der nächste Lauf holt für die bereits
-gespeicherten Mails die `INTERNALDATE` vom Server und setzt die mtimes. Jeder reparierte
-Ordner bekommt eine Markierung `.dates_backfilled`, danach passiert nichts mehr — die
-Option kann also einfach wieder aus der Config entfernt werden (zum erneuten Laufen die
-Markierungen löschen).
 
 Pro Account: `name` (auch der Verzeichnisname), `host`, `user`, optional `port` (993),
 `tls` (true = implizites TLS wie auf Port 993; STARTTLS wird nicht unterstützt), `folders`
@@ -97,10 +89,8 @@ Linux-Binary linkt OpenSSL dynamisch (`libssl.so.3`).
 | `src/config.rs` | JSON-Config (mit Kommentaren), Validierung, Passwortquellen, Hooks |
 | `src/sync.rs` | Verbindung, IDLE-Schleife, Ordner-Sync |
 | `src/maildir.rs` | Dateinamen, Flags, `scan`, durable writes, mtimes |
-| `src/backfill.rs` | einmalige Datums-Reparatur (`backfill_dates`), jederzeit entfernbar |
 
 `cargo test` fährt den echten Binary gegen gescriptete Fake-IMAP-Server: verschwundene
 Mails bleiben, UIDVALIDITY-Wechsel löscht nichts, abgebrochene Erst-Sync läuft weiter,
 kaputte Ordner blockieren die anderen nicht, `0 EXISTS` leert nichts, Login-Fehler werden
-nicht gehämmert, gespeicherte Mails tragen das Serverdatum und `backfill_dates` repariert
-ein altes Archiv genau einmal; dazu Unit-Tests für Config (inkl. Kommentare und Hooks), Maildir-Pfade und Backoff.
+nicht gehämmert, gespeicherte Mails tragen das Serverdatum; dazu Unit-Tests für Config (inkl. Kommentare und Hooks), Maildir-Pfade und Backoff.

@@ -11,7 +11,7 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub type Sess = Session<Connection>;
+type Sess = Session<Connection>;
 
 /// Socket timeouts outside IDLE. A half-open connection (laptop sleep, NAT reset) would
 /// otherwise block the account thread forever with no reconnect.
@@ -139,9 +139,6 @@ fn sync_folder(s: &mut Sess, cfg: &Config, acc: &Account, name: &str, dir: &Path
     if added + removed > 0 || new_epoch {
         let kept = if orphans > 0 { format!(" ~{orphans} kept") } else { String::new() };
         eprintln!("{}/{name}: +{added} -{removed}{kept} (total {})", acc.name, remote.len());
-    }
-    if cfg.backfill_dates {
-        crate::backfill::run(s, &acc.name, name, dir)?;
     }
     Ok(())
 }

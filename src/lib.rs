@@ -8,7 +8,6 @@
 //! unless the account sets `"expunge": true`, a changed UIDVALIDITY makes the folder stop
 //! rather than delete anything, and every message is fsynced before its name becomes visible.
 
-pub mod backfill;
 pub mod config;
 pub mod maildir;
 pub mod sync;
