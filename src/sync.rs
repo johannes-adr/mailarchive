@@ -11,7 +11,7 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-type Sess = Session<Connection>;
+pub type Sess = Session<Connection>;
 
 /// Socket timeouts outside IDLE. A half-open connection (laptop sleep, NAT reset) would
 /// otherwise block the account thread forever with no reconnect.
@@ -140,6 +140,9 @@ fn sync_folder(s: &mut Sess, cfg: &Config, acc: &Account, name: &str, dir: &Path
         let kept = if orphans > 0 { format!(" ~{orphans} kept") } else { String::new() };
         eprintln!("{}/{name}: +{added} -{removed}{kept} (total {})", acc.name, remote.len());
     }
+    if cfg.backfill_dates {
+        crate::backfill::run(s, &acc.name, name, dir)?;
+    }
     Ok(())
 }
 
@@ -151,7 +154,7 @@ fn read_uidvalidity(dir: &Path) -> Option<u32> {
 }
 
 fn write_uidvalidity(dir: &Path, uv: u32) -> Result<()> {
-    maildir::write_durable(&dir.join(".uidvalidity.tmp"), &dir.join(".uidvalidity"), format!("{uv}\n").as_bytes())
+    maildir::write_durable(&dir.join(".uidvalidity.tmp"), &dir.join(".uidvalidity"), format!("{uv}\n").as_bytes(), None)
 }
 
 /// remote uid -> maildir flags for every message in the selected folder.
@@ -199,10 +202,10 @@ fn reconcile_existing(
     Ok((removed, orphans))
 }
 
-/// Fetch messages not yet on disk, in small batches, each written via tmp/ then renamed and
-/// handed to the `mail_received` hook. Returns (added, missing), where missing counts uids
-/// the server listed but returned without a body; they stay absent locally and are retried
-/// on the next pass.
+/// Fetch messages not yet on disk, in small batches, each written via tmp/ with the server's
+/// INTERNALDATE as its mtime, then renamed and handed to the `mail_received` hook. Returns
+/// (added, missing), where missing counts uids the server listed but returned without a
+/// body; they stay absent locally and are retried on the next pass.
 fn fetch_new(
     s: &mut Sess,
     cfg: &Config,
@@ -217,12 +220,13 @@ fn fetch_new(
     for chunk in new.chunks(25) {
         let set = chunk.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
         let mut got = 0;
-        for f in s.uid_fetch(set, "(UID FLAGS BODY.PEEK[])")?.iter() {
+        for f in s.uid_fetch(set, "(UID FLAGS INTERNALDATE BODY.PEEK[])")?.iter() {
             let (Some(uid), Some(body)) = (f.uid, f.body()) else { continue };
             let flags = maildir::flags_of(f.flags());
             let dst = dir.join(maildir::subdir(&flags)).join(maildir::file_name(uv, uid, &flags));
             // tmp name without flags, so a retry after a flag change reuses the same file
-            maildir::write_durable(&dir.join("tmp").join(format!("{uv}.{uid}")), &dst, body)?;
+            let date = f.internal_date().map(|d| d.timestamp());
+            maildir::write_durable(&dir.join("tmp").join(format!("{uv}.{uid}")), &dst, body, date)?;
             cfg.hooks.on_mail_received(&dst);
             got += 1;
         }
