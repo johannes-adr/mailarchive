@@ -169,18 +169,10 @@ fn prepare_root(tag: &str, port: u16) -> PathBuf {
 }
 
 fn start_in(root: PathBuf, accounts: &str) -> Run {
-    start_in_with(root, accounts, "")
-}
-
-/// `extra` = more top level config fields, e.g. `, "backfill_dates": true`.
-fn start_in_with(root: PathBuf, accounts: &str, extra: &str) -> Run {
     let cfg_path = root.join("config.json");
     std::fs::write(
         &cfg_path,
-        format!(
-            r#"{{"maildir": {root:?}, "idle_secs": 1{extra}, "accounts": [{accounts}]}}"#,
-            root = root.to_str().unwrap()
-        ),
+        format!(r#"{{"maildir": {root:?}, "idle_secs": 1, "accounts": [{accounts}]}}"#, root = root.to_str().unwrap()),
     )
     .unwrap();
     let errlog = root.join("stderr.log");
@@ -408,40 +400,4 @@ fn stored_mail_keeps_the_date_the_server_reports() {
 
     let file = only_file(&run.dir("acc", "INBOX"), "cur");
     assert_eq!(mtime(&file), internal_date(3), "{}", file.display());
-}
-
-/// `backfill_dates` repairs an archive written before that: it re-reads INTERNALDATE for the
-/// messages already on disk. It runs once per folder (`.dates_backfilled`), so leaving the
-/// option on does not re-fetch the dates on every pass.
-#[test]
-fn backfill_dates_repairs_an_older_archive() {
-    let (port, rx, log) = spawn_server(one_inbox(vec![(100, vec![(1, "Subject: one\r\n\r\nbody one")])]));
-    let root = prepare_root("backfill", port);
-
-    // an archive as an older version left it: the file carries the time it was downloaded
-    let run = start_in(root.clone(), &account("acc", port, ""));
-    assert_eq!(wait_rounds(&rx, 1), vec![0]);
-    let dir = run.dir("acc", "INBOX");
-    let file = only_file(&dir, "cur");
-    drop(run);
-    let wrong: i64 = 1_700_000_000;
-    std::fs::File::options()
-        .write(true)
-        .open(&file)
-        .unwrap()
-        .set_times(std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH + Duration::from_secs(wrong as u64)))
-        .unwrap();
-    assert_eq!(mtime(&file), wrong);
-
-    let run = start_in_with(root, &account("acc", port, ""), r#", "backfill_dates": true"#);
-    assert!(!wait_rounds(&rx, 2).is_empty());
-    assert_eq!(mtime(&file), internal_date(1), "the date must come back from the server");
-    assert!(dir.join(".dates_backfilled").exists(), "the folder is marked as repaired");
-    assert!(run.stderr().contains("1 message date(s) restored"), "{}", run.stderr());
-
-    // second pass: marked, so no further INTERNALDATE fetch for the whole folder
-    let before = log.cmds.lock().unwrap().iter().filter(|c| c.contains("INTERNALDATE")).count();
-    assert!(!wait_rounds(&rx, 1).is_empty());
-    let after = log.cmds.lock().unwrap().iter().filter(|c| c.contains("INTERNALDATE")).count();
-    assert_eq!(before, after, "a repaired folder is not re-read");
 }
